@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2021-2025 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2021-2026 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: CC0-1.0
  *
@@ -10,6 +10,23 @@
  * Unless required by applicable law or agreed to in writing, this
  * software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
  * CONDITIONS OF ANY KIND, either express or implied.
+ *
+ * --- Local modifications: ESP32-C6 single-chip Thread Border Router for Home
+ *     Assistant. Re-based onto the ESP-IDF v5.5.x ot_br example, which uses the
+ *     high-level esp_openthread_start() / esp_openthread_border_router_start()
+ *     bring-up (including the explicit Wi-Fi/802.15.4 coexistence enable).
+ *
+ *     The only addition to the stock example is a minimal OTBR-compatible REST
+ *     API on port 8080 (start_dataset_server) so Home Assistant's OpenThread
+ *     Border Router integration can read node state, the active dataset, the
+ *     border-agent id and the ext address over the Wi-Fi LAN.
+ *
+ *     There is intentionally NO "RA suppression" here. The OpenThread routing
+ *     manager (enabled by esp_openthread_border_router_init) advertises RAs with
+ *     Router Lifetime 0 — it is never the LAN default gateway — and the OMR
+ *     default-route prefix it publishes is exactly what gives Thread/Matter
+ *     devices a route to the LAN/internet. Manage any genuine LAN-side IPv6
+ *     conflict at the router (disable NAT66, single RA source). See README.
  */
 
 #include <stdio.h>
@@ -17,49 +34,37 @@
 
 #include "sdkconfig.h"
 #include "esp_check.h"
+#include "esp_coexist.h"
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_openthread.h"
-#include "esp_openthread_border_router.h"
-#include "esp_openthread_cli.h"
 #include "esp_openthread_lock.h"
 #include "esp_openthread_netif_glue.h"
+#include "esp_openthread_spinel.h"
 #include "esp_openthread_types.h"
 #if CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
 #include "esp_ot_cli_extension.h"
 #endif // CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
 #include "esp_ot_config.h"
-#include "esp_ot_wifi_cmd.h"
 #include "esp_vfs_dev.h"
 #include "esp_vfs_eventfd.h"
-#include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
 #include "mdns.h"
 #include "nvs_flash.h"
-#include "protocol_examples_common.h"
-#include "driver/gpio.h"
-#include "driver/uart.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "hal/uart_types.h"
-#include "openthread/error.h"
-#include "openthread/instance.h"
-#include "openthread/logging.h"
-#include "openthread/tasklet.h"
+#include "ot_examples_br.h"
+#include "ot_examples_common.h"
+
+// --- OTBR REST API dependencies (local addition) ---
+#include "esp_http_server.h"
+#include "openthread/border_agent.h"
+#include "openthread/dataset.h"
+#include "openthread/link.h"
+#include "openthread/thread.h"
 
 #if CONFIG_OPENTHREAD_STATE_INDICATOR_ENABLE
 #include "ot_led_strip.h"
-#endif
-
-#if CONFIG_OPENTHREAD_BR_AUTO_START
-#include "example_common_private.h"
-#include "protocol_examples_common.h"
-#endif
-
-#if !CONFIG_OPENTHREAD_BR_AUTO_START && CONFIG_EXAMPLE_CONNECT_ETHERNET
-// TZ-1109: Add a menchanism for connecting ETH manually.
-#error Currently we do not support a manual way to connect ETH, if you want to use ETH, please enable OPENTHREAD_BR_AUTO_START.
 #endif
 
 #define TAG "esp_ot_br"
@@ -84,139 +89,6 @@ static void rcp_failure_hardware_reset_handler(void)
 }
 #endif
 
-#if CONFIG_EXTERNAL_COEX_ENABLE
-static void ot_br_external_coexist_init(void)
-{
-    esp_external_coex_gpio_set_t gpio_pin = ESP_OPENTHREAD_DEFAULT_EXTERNAL_COEX_CONFIG();
-    esp_external_coex_set_work_mode(EXTERNAL_COEX_LEADER_ROLE);
-    ESP_ERROR_CHECK(esp_enable_extern_coex_gpio_pin(CONFIG_EXTERNAL_COEX_WIRE_TYPE, gpio_pin));
-}
-#endif /* CONFIG_EXTERNAL_COEX_ENABLE */
-
-static void ot_task_worker(void *aContext)
-{
-    esp_openthread_platform_config_t config = {
-        .radio_config = ESP_OPENTHREAD_DEFAULT_RADIO_CONFIG(),
-        .host_config = ESP_OPENTHREAD_DEFAULT_HOST_CONFIG(),
-        .port_config = ESP_OPENTHREAD_DEFAULT_PORT_CONFIG(),
-    };
-
-    esp_netif_config_t cfg = ESP_NETIF_DEFAULT_OPENTHREAD();
-    esp_netif_t       *openthread_netif = esp_netif_new(&cfg);
-    assert(openthread_netif != NULL);
-
-    // Initialize the OpenThread stack
-    ESP_ERROR_CHECK(esp_openthread_init(&config));
-    ESP_ERROR_CHECK(esp_netif_attach(openthread_netif, esp_openthread_netif_glue_init(&config)));
-    esp_openthread_lock_acquire(portMAX_DELAY);
-#if CONFIG_OPENTHREAD_LOG_LEVEL_DYNAMIC
-    // The OpenThread log level directly matches ESP log level
-    (void)otLoggingSetLevel(CONFIG_LOG_DEFAULT_LEVEL);
-#endif // CONFIG_OPENTHREAD_LOG_LEVEL_DYNAMIC
-#if CONFIG_OPENTHREAD_CLI
-    esp_openthread_cli_init();
-#if CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
-    esp_cli_custom_command_init();
-#endif // CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
-    esp_openthread_cli_create_task();
-#endif // CONFIG_OPENTHREAD_CLI
-    esp_openthread_lock_release();
-
-    // Run the main loop
-    esp_openthread_launch_mainloop();
-
-    // Clean up
-    esp_openthread_netif_glue_deinit();
-    esp_netif_destroy(openthread_netif);
-    esp_vfs_eventfd_unregister();
-    vTaskDelete(NULL);
-}
-
-// NOTE: an earlier revision ran an "RA suppression" task here. On every
-// OT_CHANGED_THREAD_NETDATA change it removed the default-route on-mesh (OMR)
-// prefix (otBorderRouterRemoveOnMeshPrefix + otBorderRouterRegister), intending
-// to stop the device from advertising IPv6 Router Advertisements on the Wi-Fi
-// LAN. It was removed because that approach was both ineffective and harmful:
-//
-//   * ESP-IDF's esp_openthread_border_router_init() already enables the
-//     OpenThread Routing Manager, which is what emits the RAs. Deleting the OMR
-//     prefix only removes the Thread->infrastructure ROUTE from local Network
-//     Data; it does NOT stop RA emission (the on-link PIO + SLLAO are sent
-//     regardless), and the routing manager simply re-publishes the prefix.
-//   * The BR's RAs carry Router Lifetime 0 — the device is never advertised as
-//     an IPv6 default gateway, so it cannot hijack the LAN default route. The
-//     host "router" neighbour flag is just the standard NDP IsRouter bit set on
-//     any RA sender; it is not "I am your gateway".
-//   * The OMR default-route prefix is exactly what gives Thread/Matter devices a
-//     route out to the LAN/internet, so removing it degrades the border
-//     router's core function (and Matter-over-Thread connectivity).
-//
-// Manage any genuine LAN-side IPv6 conflict at the router (disable NAT66, keep a
-// single RA source on the segment) rather than in firmware. See README
-// "Network Notes".
-
-void ot_br_init(void *ctx)
-{
-#if CONFIG_OPENTHREAD_CLI_WIFI
-    ESP_ERROR_CHECK(esp_ot_wifi_config_init());
-#endif
-#if CONFIG_OPENTHREAD_BR_AUTO_START
-#if CONFIG_EXAMPLE_CONNECT_WIFI || CONFIG_EXAMPLE_CONNECT_ETHERNET
-    bool wifi_or_ethernet_connected = false;
-#else
-#error No backbone netif!
-#endif
-#if CONFIG_EXAMPLE_CONNECT_WIFI
-    char wifi_ssid[32] = "";
-    char wifi_password[64] = "";
-    if (esp_ot_wifi_config_get_ssid(wifi_ssid) == ESP_OK) {
-        ESP_LOGI(TAG, "use the Wi-Fi config from NVS");
-        esp_ot_wifi_config_get_password(wifi_password);
-    } else {
-        ESP_LOGI(TAG, "use the Wi-Fi config from Kconfig");
-        strcpy(wifi_ssid, CONFIG_EXAMPLE_WIFI_SSID);
-        strcpy(wifi_password, CONFIG_EXAMPLE_WIFI_PASSWORD);
-    }
-    if (esp_ot_wifi_connect(wifi_ssid, wifi_password) == ESP_OK) {
-        wifi_or_ethernet_connected = true;
-    } else {
-        ESP_LOGE(TAG, "Fail to connect to Wi-Fi, please try again manually");
-    }
-#endif
-#if CONFIG_EXAMPLE_CONNECT_ETHERNET
-    ESP_ERROR_CHECK(example_ethernet_connect());
-    wifi_or_ethernet_connected = true;
-#endif
-#endif // CONFIG_OPENTHREAD_BR_AUTO_START
-
-#if CONFIG_EXTERNAL_COEX_ENABLE
-    ot_br_external_coexist_init();
-#endif // CONFIG_EXTERNAL_COEX_ENABLE
-    ESP_ERROR_CHECK(mdns_init());
-    ESP_ERROR_CHECK(mdns_hostname_set("esp-ot-br"));
-
-    esp_openthread_lock_acquire(portMAX_DELAY);
-#if CONFIG_OPENTHREAD_STATE_INDICATOR_ENABLE
-    ESP_ERROR_CHECK(esp_openthread_state_indicator_init(esp_openthread_get_instance()));
-#endif
-#if CONFIG_OPENTHREAD_BR_AUTO_START
-    if (wifi_or_ethernet_connected) {
-        esp_openthread_set_backbone_netif(get_example_netif());
-        ESP_ERROR_CHECK(esp_openthread_border_router_init());
-#if CONFIG_EXAMPLE_CONNECT_WIFI
-        esp_ot_wifi_border_router_init_flag_set(true);
-#endif
-        otOperationalDatasetTlvs dataset;
-        otError error = otDatasetGetActiveTlvs(esp_openthread_get_instance(), &dataset);
-        ESP_ERROR_CHECK(esp_openthread_auto_start((error == OT_ERROR_NONE) ? &dataset : NULL));
-    } else {
-        ESP_LOGE(TAG, "Auto-start mode failed, please try to start manually");
-    }
-#endif // CONFIG_OPENTHREAD_BR_AUTO_START
-    esp_openthread_lock_release();
-    vTaskDelete(NULL);
-}
-
 // --- OTBR-compatible REST API (port 8080) ---
 // Implements the endpoints Home Assistant's OpenThread Border Router integration
 // (python-otbr-api) calls during setup, plus a couple of convenience routes:
@@ -226,11 +98,6 @@ void ot_br_init(void *ctx)
 //   GET /node/ext-address         -> "<16 hex>" JSON string (ext address)     [HA]
 //   GET /networks/dataset/active  -> {"ActiveDataset":"0e08..."}  (non-standard, kept)
 //   GET /dataset                  -> raw hex (convenience)
-#include "esp_http_server.h"
-#include "openthread/border_agent.h"
-#include "openthread/dataset.h"
-#include "openthread/link.h"
-#include "openthread/thread.h"
 
 // Write n bytes as lowercase hex into out (out must hold 2*n + 1 chars).
 static void bytes_to_hex(const uint8_t *in, size_t n, char *out)
@@ -399,24 +266,66 @@ void app_main(void)
     // * netif
     // * task queue
     // * border router
-    esp_vfs_eventfd_config_t eventfd_config = {
+    size_t max_eventfd = 3;
+
 #if CONFIG_OPENTHREAD_RADIO_NATIVE || CONFIG_OPENTHREAD_RADIO_SPINEL_SPI
-        // * radio driver (A native radio device needs a eventfd for radio driver.)
-        // * SpiSpinelInterface (The Spi Spinel Interface needs a eventfd.)
-        // The above will not exist at the same time.
-        .max_fds = 4,
-#else
-        .max_fds = 3,
+    // * radio driver (A native radio device needs a eventfd for radio driver.)
+    // * SpiSpinelInterface (The Spi Spinel Interface needs a eventfd.)
+    // The above will not exist at the same time.
+    max_eventfd++;
 #endif
+#if CONFIG_OPENTHREAD_RADIO_TREL
+    // * TREL reception (The Thread Radio Encapsulation Link needs a eventfd for reception.)
+    max_eventfd++;
+#endif
+    esp_vfs_eventfd_config_t eventfd_config = {
+        .max_fds = max_eventfd,
     };
     ESP_ERROR_CHECK(esp_vfs_eventfd_register(&eventfd_config));
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_ERROR_CHECK(mdns_init());
+    ESP_ERROR_CHECK(mdns_hostname_set("esp-ot-br"));
 #if CONFIG_OPENTHREAD_SUPPORT_HW_RESET_RCP
     esp_openthread_register_rcp_failure_handler(rcp_failure_hardware_reset_handler);
 #endif
-    xTaskCreate(ot_task_worker, "ot_br_main", 8192, xTaskGetCurrentTaskHandle(), 5, NULL);
-    xTaskCreate(ot_br_init, "ot_br_init", 6144, NULL, 4, NULL);
+
+#if CONFIG_OPENTHREAD_CLI
+    ot_console_start();
+    ot_register_external_commands();
+#endif
+
+#if CONFIG_ESP_COEX_EXTERNAL_COEXIST_ENABLE
+    ot_external_coexist_init();
+#endif
+
+    static esp_openthread_config_t config = {
+        .netif_config = ESP_NETIF_DEFAULT_OPENTHREAD(),
+        .platform_config = {
+            .radio_config = ESP_OPENTHREAD_DEFAULT_RADIO_CONFIG(),
+            .host_config = ESP_OPENTHREAD_DEFAULT_HOST_CONFIG(),
+            .port_config = ESP_OPENTHREAD_DEFAULT_PORT_CONFIG(),
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_openthread_start(&config));
+#if CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
+    esp_cli_custom_command_init();
+#endif
+#if CONFIG_OPENTHREAD_BORDER_ROUTER_AUTO_START
+    ESP_ERROR_CHECK(esp_openthread_border_router_start());
+#if CONFIG_ESP_COEX_SW_COEXIST_ENABLE && CONFIG_SOC_IEEE802154_SUPPORTED
+    ESP_ERROR_CHECK(esp_coex_wifi_i154_enable());
+#endif
+#endif
+#if CONFIG_OPENTHREAD_STATE_INDICATOR_ENABLE
+    ESP_ERROR_CHECK(esp_openthread_state_indicator_init(esp_openthread_get_instance()));
+#endif
+#if CONFIG_OPENTHREAD_NETWORK_AUTO_START
+    ot_network_auto_start();
+#endif
+
+    // Local addition: start the OTBR-compatible REST API for Home Assistant.
     start_dataset_server();
 }

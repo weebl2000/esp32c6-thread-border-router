@@ -1,73 +1,84 @@
 # =============================================================================
-# sdkconfig.defaults — ot_br on XIAO ESP32C6 (4 MB flash, USB power only)
+# sdkconfig.defaults — ot_br on XIAO ESP32-C6 (4 MB flash, USB power only)
+# Re-based for ESP-IDF v5.5.x.
 #
 # Usage:
-#   Copy this file to examples/openthread/ot_br/sdkconfig.defaults
-#   (append to the existing file — do not replace it)
-#
-#   Then copy partitions_4mb_otbr.csv to the same folder and run:
+#   APPEND this file's contents to the BOTTOM of
+#     $IDF_PATH/examples/openthread/ot_br/sdkconfig.defaults
+#   (do not replace it — the example's own defaults must stay; ours override
+#   them because they come last). Then copy partitions_4mb_otbr.csv and
+#   main/{esp_ot_br.c,CMakeLists.txt} into the example, set your Wi-Fi creds, and:
 #     idf.py set-target esp32c6
 #     idf.py build flash monitor
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Flash & partition table
+# Flash & partition table (override the example's 1900K partitions.csv)
 # -----------------------------------------------------------------------------
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb_otbr.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions_4mb_otbr.csv"
 
 # -----------------------------------------------------------------------------
-# Wi-Fi credentials — CHANGE THESE
+# Wi-Fi backbone — CHANGE THESE. example_connect() (used by the border-router
+# auto-init path) reads these; set your AP's SSID/PSK.
 # -----------------------------------------------------------------------------
+CONFIG_EXAMPLE_CONNECT_WIFI=y
+CONFIG_EXAMPLE_CONNECT_IPV6=y
 CONFIG_EXAMPLE_WIFI_SSID="YOUR_WIFI_SSID"
 CONFIG_EXAMPLE_WIFI_PASSWORD="YOUR_WIFI_PASSWORD"
 
 # -----------------------------------------------------------------------------
-# OpenThread — native radio (single-chip C6, no external RCP)
+# OpenThread — single-chip C6: native 802.15.4 radio + Wi-Fi/15.4 SW coexistence
 # -----------------------------------------------------------------------------
+# Override the v5.5 example default (CONFIG_OPENTHREAD_RADIO_SPINEL_UART=y).
 CONFIG_OPENTHREAD_RADIO_NATIVE=y
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 
-# Auto-start: connect to the configured Wi-Fi and form the Thread network on
-# boot. REQUIRED — without it ot_br_init does nothing (no Wi-Fi, no border
-# router). Defaults to 'n' in the example's Kconfig, so it must be set here.
-CONFIG_OPENTHREAD_BR_AUTO_START=y
+# Auto-start on boot. In v5.5 these are split into two example-level symbols and
+# BOTH default to 'n', so both must be set:
+#   *_BORDER_ROUTER_AUTO_START -> example_connect (Wi-Fi) + border-router init
+#                                 + the explicit esp_coex_wifi_i154_enable()
+#   *_NETWORK_AUTO_START       -> create/join the Thread network
+# (These replace the v5.4.x CONFIG_OPENTHREAD_BR_AUTO_START symbol.)
+CONFIG_OPENTHREAD_BORDER_ROUTER_AUTO_START=y
+CONFIG_OPENTHREAD_NETWORK_AUTO_START=y
 
-# NOTE: the OpenThread CLI is intentionally left on its default UART0 console.
-# Routing it to the USB-Serial-JTAG (to reach it over the XIAO's USB-C port)
-# makes the ot_cli task busy-spin and trips the task watchdog, so we don't.
-# Configure the Thread network via the build options below instead of the CLI.
+# The border-router auto-init path hard-#errors if the CLI 'wifi' command is on,
+# and we drive Wi-Fi via example_connect instead — keep it off.
+CONFIG_OPENTHREAD_CLI_WIFI=n
+
+# NOTE: the OpenThread CLI stays on its default UART0 console. Routing it to the
+# USB-Serial-JTAG (to reach it over the XIAO's USB-C port) makes the ot_cli task
+# busy-spin and trips the task watchdog, so we don't.
 
 # -----------------------------------------------------------------------------
-# Thread network credentials — CHANGE THESE (security)
+# Thread network credentials — CHANGE THESE (security) [optional]
 # -----------------------------------------------------------------------------
-# The stock ESP-IDF OpenThread defaults use a PUBLICLY KNOWN example network key
-# (00112233...), PAN ID 0x1234, etc. — every unmodified build forms a Thread
-# mesh anyone within radio range can join or sniff. Generate your own:
-#     openssl rand -hex 16    # NETWORK key and PSKc (16 bytes each)
+# A previously-formed dataset persists in NVS and is reused on boot; the options
+# below only take effect on a FRESH NVS (idf.py erase-flash). The stock
+# OpenThread example credentials are PUBLICLY KNOWN, so for a brand-new network
+# generate your own:
+#     openssl rand -hex 16    # network key and PSKc (16 bytes each)
 #     openssl rand -hex 8     # extended PAN ID (8 bytes)
-# then uncomment and fill these in. Only takes effect on a fresh NVS
-# (idf.py erase-flash) — a previously-formed dataset persists in flash.
-#CONFIG_OPENTHREAD_NETWORK_MASTERKEY="<32 hex chars>"
-#CONFIG_OPENTHREAD_NETWORK_PSKC="<32 hex chars>"
-#CONFIG_OPENTHREAD_NETWORK_EXTPANID="<16 hex chars>"
-#CONFIG_OPENTHREAD_NETWORK_PANID=0x1234
-#CONFIG_OPENTHREAD_MESH_LOCAL_PREFIX="fdXX:XXXX:XXXX:0::/64"
+# then set the matching CONFIG_OPENTHREAD_NETWORK_* options (confirm the exact
+# symbol names for your IDF version via 'idf.py menuconfig').
 
 # -----------------------------------------------------------------------------
-# Compiler optimisations — needed to fit in 4MB
+# Compiler optimisations — needed to fit in 4 MB
 # -----------------------------------------------------------------------------
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
 CONFIG_COMPILER_SAVE_RESTORE_LIBCALLS=y
 
 # -----------------------------------------------------------------------------
-# Logging — use INFO for debugging, WARN for production
+# Logging — INFO app logs, WARN for OpenThread to keep it quiet
 # -----------------------------------------------------------------------------
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_OPENTHREAD_LOG_LEVEL_DYNAMIC=n
 CONFIG_OPENTHREAD_LOG_LEVEL_WARN=y
 
-# Newlib nano keeps printf small
+# Nano-printf keeps printf small. On v5.5 the symbol is CONFIG_LIBC_NEWLIB_NANO_FORMAT
+# (it was CONFIG_NEWLIB_NANO_FORMAT on v5.4.x — the wrong name silently no-ops).
 CONFIG_LIBC_NEWLIB_NANO_FORMAT=y

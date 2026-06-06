@@ -66,7 +66,7 @@ ESP-IDF is Espressif's development framework. You only need to do this once.
 2. During installation, select **ESP32-C6** as the target chip
 3. Or clone manually:
    ```cmd
-   git clone -b v5.4.2 --recursive https://github.com/espressif/esp-idf.git
+   git clone -b v5.5.4 --recursive https://github.com/espressif/esp-idf.git
    cd esp-idf
    install.bat esp32c6
    ```
@@ -74,12 +74,17 @@ ESP-IDF is Espressif's development framework. You only need to do this once.
 ### Linux / macOS
 
 ```bash
-git clone -b v5.4.2 --recursive https://github.com/espressif/esp-idf.git
+git clone -b v5.5.4 --recursive https://github.com/espressif/esp-idf.git
 cd esp-idf
 ./install.sh esp32c6
 ```
 
-> **Important:** Always use ESP-IDF **v5.4.2** — other versions may conflict with the toolchain.
+> **Important:** This project is developed and verified on ESP-IDF **v5.5.4**. The version
+> isn't magic — the real rule is to run that version's `install.sh esp32c6` and source its
+> `export.sh` in a **fresh terminal**. The "other versions break the toolchain" symptom is
+> just having multiple ESP-IDF checkouts sourced in one shell. (It was originally built on
+> v5.4.2; v5.5.x is the current in-service line and ships ~2 years of OpenThread/coexistence
+> fixes. Any in-service 5.5.x should work.)
 
 ---
 
@@ -116,6 +121,7 @@ Copy the following files from this repository into the example folder:
 | `partitions_4mb_otbr.csv` | `examples/openthread/ot_br/` |
 | `sdkconfig.defaults` | append to `examples/openthread/ot_br/sdkconfig.defaults` |
 | `main/esp_ot_br.c` | replace `examples/openthread/ot_br/main/esp_ot_br.c` |
+| `main/CMakeLists.txt` | replace `examples/openthread/ot_br/main/CMakeLists.txt` (adds `esp_http_server` to the example's requires) |
 
 > **For sdkconfig.defaults:** Open the existing file and paste the contents of this repo's `sdkconfig.defaults` at the **bottom**. Do not replace the whole file.
 
@@ -155,9 +161,9 @@ idf.py build flash -p COM11 monitor
 
 ### Linux / macOS
 ```bash
-idf.py build flash -p /dev/ttyUSB0 monitor
+idf.py build flash -p /dev/ttyACM0 monitor
 ```
-(replace `/dev/ttyUSB0` with your actual port)
+(The XIAO ESP32-C6 uses native USB-Serial-JTAG, so on Linux it's usually `/dev/ttyACM0`, **not** `/dev/ttyUSB0`. Check `ls /dev/ttyACM*` and replace if needed.)
 
 The build takes ~10 minutes the first time. After flashing, watch the monitor output. After ~20 seconds you should see the device connect to WiFi and get an IP address.
 
@@ -208,11 +214,13 @@ Thread/Matter requires proper **end-to-end IPv6 connectivity**. Several common n
 ### Home Assistant in a VM
 Make sure the VM uses **bridged networking** (not NAT). The VM must be on the same network segment as the ESP border router.
 
-### Static route for Thread prefix (probably optional)
-The ESP advertises the Thread network prefix (eg `fd55:ec6e:b588::/48` by default) via Router Advertisements. If your router blocks or doesn't propagate these, add a static IPv6 route:
+### Route to the Thread (OMR) prefix
+The border router advertises a route to its **OMR prefix** (a ULA /64 it generates, e.g. `fd20:1f93:f982:1::/64`) on WiFi via an RFC 4191 Route Information Option in its RAs. Hosts that honor RIOs (modern Linux, incl. most HA hosts on the same LAN) install this route automatically — you can confirm with `ip -6 route` (you'll see `<omr-prefix> via fe80::… proto ra`). If your router or controller is on a **different segment**, or doesn't honor RIOs, add a static IPv6 route:
 
-- **Destination:** eg `fd55:ec6e:b588::/48` (check your actual prefix from the dataset)
-- **Gateway:** ESP's link-local IPv6 address (visible in router's neighbor table)
+- **Destination:** your OMR prefix (find it via `ip -6 route` on a LAN host, or it's the non-default route the ESP advertises)
+- **Gateway:** the ESP's link-local IPv6 address (in your router's neighbor table)
+
+> The OMR prefix is auto-generated and *can* change if the Thread network re-forms; a hard-coded static route can go stale. OpenThread keeps it stable in practice.
 
 ### pfsense specific
 1. Add a static IPv6 gateway pointing to the ESP's link-local address
@@ -229,13 +237,18 @@ The ESP advertises the Thread network prefix (eg `fd55:ec6e:b588::/48` by defaul
 - Signal below -85 dBm causes instability with Thread coexistence
 
 ### Build fails with "Tool doesn't match supported version"
-You have multiple ESP-IDF versions installed. Always open a **fresh terminal** and run `export.bat` / `. ./export.sh` from your **cloned v5.4.2** folder before running any `idf.py` command.
+You have multiple ESP-IDF versions installed. Always open a **fresh terminal** and run `export.bat` / `. ./export.sh` from your **cloned v5.5.4** folder before running any `idf.py` command. (Each ESP-IDF version ships its own matched toolchain + Python venv; run that version's `install.sh esp32c6` once.)
 
 ### Build fails with "esp_http_server.h: No such file or directory"
-The REST API in `esp_ot_br.c` depends on the `esp_http_server` component. If your ESP-IDF version's `ot_br` example doesn't already require it, add `esp_http_server` to the `REQUIRES` (or `PRIV_REQUIRES`) list in `examples/openthread/ot_br/main/CMakeLists.txt`, then rebuild.
+The REST API in `esp_ot_br.c` depends on the `esp_http_server` component. This repo's `main/CMakeLists.txt` (which you copy over the example's) already lists it in `PRIV_REQUIRES`. If you skipped that file, add `esp_http_server` to the `PRIV_REQUIRES` list in `examples/openthread/ot_br/main/CMakeLists.txt`, then rebuild.
 
-### LAN IPv6 stops working when ESP is powered on
-The ESP's border routing manager sends Router Advertisements on WiFi which can conflict with your router. The `suppress_backbone_ra_task` in the firmware handles this automatically after 20 seconds. If you still see issues, check that `otBorderRouterRemoveOnMeshPrefix` is being called successfully in the logs.
+### LAN IPv6 misbehaves when the ESP is powered on
+The border router emits IPv6 Router Advertisements on WiFi (this is normal and required — it's how Thread devices become reachable). Its RAs carry **Router Lifetime 0**, so it does **not** become your LAN default gateway and cannot hijack your default route. What it *does* add is a route to its Thread prefix (a Route Information Option). If your network misbehaves, fix it at the router, not in firmware:
+- Disable **NAT66**.
+- Ensure only **one** device advertises the default route / your main prefix (your real router). The ESP isn't one of them, but a misconfigured second router could be.
+- If hosts don't pick up the route to the Thread prefix automatically, add a static route (see [Network Notes](#network-notes)).
+
+(Older firmware shipped an "RA suppression" task to address this; it was removed — it didn't stop the RAs and it broke Thread→LAN connectivity. See [How it works](#how-it-works).)
 
 ### Matter commissioning fails with "PASESession timed out"
 - Check that NAT66 is disabled
@@ -248,7 +261,7 @@ The ESP's border routing manager sends Router Advertisements on WiFi which can c
 - Do **Settings → Companion app → Troubleshooting → Sync Thread credentials** on your phone before each commissioning attempt
 
 ### ESP crashes after ~30 seconds (SW_CPU reset)
-This was caused by calling `otBorderRoutingSetEnabled()` too early. Make sure you are using the version of `esp_ot_br.c` from this repository which uses `otBorderRouterRemoveOnMeshPrefix()` instead.
+Not observed with the current firmware. ESP-IDF's `esp_openthread_border_router_init()` already enables the OpenThread routing manager via the supported path, so don't call `otBorderRoutingSetEnabled()` yourself — a duplicate/early call (before the infra netif is up, or without holding the OpenThread lock) is the likely cause of the historical crash. The current code uses the stock high-level bring-up (`esp_openthread_start()` → `esp_openthread_border_router_start()`) and does not call it.
 
 ---
 
@@ -260,15 +273,22 @@ On top of the base example, this project adds:
 
 1. **OTBR-compatible REST API** — Home Assistant's Matter integration expects specific endpoints (`/node`, `/networks/dataset/active`) that the base example doesn't provide. We add a minimal HTTP server implementing these endpoints.
 
-2. **RA suppression** — By default the border routing manager floods the WiFi network with Router Advertisements, breaking existing IPv6 setups. We remove the on-mesh prefix after initialization to prevent this.
+2. **4MB partition table** — The default partition layout assumes 8MB+ flash. This custom layout fits everything into 4MB by removing OTA and RCP update slots.
 
-3. **4MB partition table** — The default partition layout assumes 8MB+ flash. This custom layout fits everything into 4MB by removing OTA and RCP update slots.
+> **Note — no "RA suppression":** earlier versions of this firmware ran a task that
+> deleted the border router's default-route on-mesh (OMR) prefix, believing it stopped
+> Router Advertisements from "breaking" the LAN. That was removed. The OpenThread routing
+> manager (which ESP-IDF enables automatically) advertises RAs with **Router Lifetime 0** —
+> the device is never your LAN's default gateway — and the OMR prefix it publishes is exactly
+> the route your Thread/Matter devices need to reach the LAN/internet. Deleting it was both
+> ineffective (RAs are still sent) and harmful (it broke Thread→LAN routing). Handle any real
+> LAN-side IPv6 conflict at the router (see [Network Notes](#network-notes)), not in firmware.
 
 ---
 
 ## Known limitations
 
-- **Single RF path:** WiFi and Thread share one antenna. This reduces throughput compared to a two-chip setup (e.g. ESP32-S3 + ESP32-H2). Fine for sensor polling, not ideal for high-bandwidth devices.
+- **Single RF path (officially "unstable"):** WiFi and Thread share one 2.4 GHz radio, time-sliced via software coexistence — the chip can't receive both at once. Espressif's own coexistence matrix rates *WiFi-STA + Thread-Router* (what a border router is) as **C1 / unstable**, and recommends a dual-chip design (e.g. ESP32-S3 host + ESP32-H2 RCP) for a "real" border router. No config fixes this — it's inherent. **Fine for sensor polling (Matter air-quality/contact sensors); not for high-bandwidth or many chatty devices.** Keeping your 2.4 GHz WiFi channel away from the Thread channel helps.
 - **No RCP auto-update:** Disabled to save flash space.
 - **No web GUI:** Disabled to save flash space.
 - **WiFi credentials in NVS:** Stored in flash. The backup `.bin` file contains your credentials — don't share it.
