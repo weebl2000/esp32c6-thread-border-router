@@ -1,16 +1,20 @@
-**⚠️ Early Proof of Concept**
+**✅ Working — tested and running reliably on my setup**
 
-This project is a working proof of concept, not a polished product. I got it 
-working on my setup — your mileage may vary, especially depending on your 
-network configuration (IPv6 routing, NAT66, VM networking all matter).
+This started as a proof of concept, but it's been running as my Thread Border
+Router for a while now and does its job well: connecting Matter sensors over
+Thread to Home Assistant. It's not a polished commercial product, and how
+smoothly setup goes for you depends a lot on your network (IPv6 routing, NAT66,
+and VM networking all matter — see [Network Notes](#network-notes)), but the
+firmware itself has proven stable in day-to-day use.
 
-**Known limitations to be aware of:**
-- Uses the ESP32-C6's internal PCB antenna — RF range is limited, keep it 
-  close to both your WiFi router and your Thread devices. I'll try to get
-  it working with the external antenna if i find some time
-- WiFi and Thread share a single RF path — performance is worse than a 
-  dedicated two-chip border router
-- Has not been extensively tested beyond the author's own setup
+**Honest limitations to be aware of:**
+- Uses the ESP32-C6's internal PCB antenna — RF range is limited, so keep it 
+  close to both your WiFi router and your Thread devices. I'll try the external
+  antenna variant if I find the time.
+- WiFi and Thread share a single RF path — fine for polling sensors, but worse
+  than a dedicated two-chip border router and not built for heavy load.
+- Tested primarily on the author's own setup, so expect to do some network
+  tweaking to fit yours.
 
 **AI disclosure:** I'm just an enthusiast, not an embedded systems expert. 
 This project was built with very heavy assistance from 
@@ -41,12 +45,14 @@ Turn a $5 XIAO ESP32-C6 into a fully functional Thread Border Router that connec
 
 ## Compatibility
 
-Tested with:
+Tested with, and in continuous use on:
 - IKEA Alpstuga (Matter over Thread air quality sensor)
 - Home Assistant running in a VM (with bridged networking)
 - pfsense router (see [Network Notes](#network-notes) for IPv6 requirements)
 
-Should work with any Matter over Thread device.
+Home Assistant auto-discovers the border router over mDNS, the Thread network
+attaches and stays attached, and Matter commissioning works end-to-end. Should
+work with any Matter over Thread device.
 
 ## Prerequisites
 
@@ -327,7 +333,7 @@ python -m esptool --chip esp32c6 -p <PORT> write_flash 0x0 backup.bin
 
 ## Contributing
 
-This is an early proof of concept. Known areas for improvement:
+It works well for sensor use, but there's plenty of room for improvement. Known areas:
 
 - ESPHome integration (would make deployment much easier, that would be nice)
 - Automatic IPv6 route advertisement to upstream routers
