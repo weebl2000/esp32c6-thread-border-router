@@ -43,7 +43,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "hal/uart_types.h"
-#include "openthread/border_router.h"
 #include "openthread/error.h"
 #include "openthread/instance.h"
 #include "openthread/logging.h"
@@ -133,64 +132,28 @@ static void ot_task_worker(void *aContext)
     vTaskDelete(NULL);
 }
 
-// --- Suppress backbone RA flooding ---
-// The OpenThread routing manager publishes a default-route on-mesh prefix and
-// floods the WiFi/backbone link with IPv6 Router Advertisements, which breaks
-// existing LAN IPv6 setups. We reactively remove default-route on-mesh prefixes
-// whenever the network data changes, rather than once at boot — the routing
-// manager can re-publish them at any time. (Calling otBorderRoutingSetEnabled()
-// to stop this at the source caused a SW_CPU reset, hence this approach.)
-#define RA_MAX_PREFIXES 8
-static TaskHandle_t s_ra_worker = NULL;
-
-static void ra_suppress_once(void)
-{
-    esp_openthread_lock_acquire(portMAX_DELAY);
-    otInstance *instance = esp_openthread_get_instance();
-    otNetworkDataIterator iterator = OT_NETWORK_DATA_ITERATOR_INIT;
-    otBorderRouterConfig config;
-    otIp6Prefix to_remove[RA_MAX_PREFIXES];
-    int n = 0;
-    // Single pass — collect default-route prefixes. No iterator reset, so this
-    // can never loop forever even if a removal fails to take effect.
-    while (n < RA_MAX_PREFIXES &&
-           otBorderRouterGetNextOnMeshPrefix(instance, &iterator, &config) == OT_ERROR_NONE) {
-        if (config.mDefaultRoute) {
-            to_remove[n++] = config.mPrefix;
-        }
-    }
-    if (n == RA_MAX_PREFIXES) {
-        ESP_LOGW(TAG, "RA suppression: hit prefix cap (%d), some may remain", RA_MAX_PREFIXES);
-    }
-    for (int i = 0; i < n; i++) {
-        otBorderRouterRemoveOnMeshPrefix(instance, &to_remove[i]);
-    }
-    if (n > 0) {
-        // Register the updated local network data once, after all removals.
-        otBorderRouterRegister(instance);
-        ESP_LOGI(TAG, "RA suppression: removed %d default-route prefix(es)", n);
-    }
-    esp_openthread_lock_release();
-}
-
-static void ra_suppress_worker(void *arg)
-{
-    for (;;) {
-        // Block until ot_state_changed() signals a network-data change.
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        ra_suppress_once();
-    }
-}
-
-// Runs in the OpenThread task with the OT lock already held — do NOT acquire the
-// lock or mutate network data here. Just defer the work to the worker task.
-static void ot_state_changed(otChangedFlags flags, void *context)
-{
-    if ((flags & OT_CHANGED_THREAD_NETDATA) && s_ra_worker != NULL) {
-        xTaskNotifyGive(s_ra_worker);
-    }
-}
-// --- end RA suppression ---
+// NOTE: an earlier revision ran an "RA suppression" task here. On every
+// OT_CHANGED_THREAD_NETDATA change it removed the default-route on-mesh (OMR)
+// prefix (otBorderRouterRemoveOnMeshPrefix + otBorderRouterRegister), intending
+// to stop the device from advertising IPv6 Router Advertisements on the Wi-Fi
+// LAN. It was removed because that approach was both ineffective and harmful:
+//
+//   * ESP-IDF's esp_openthread_border_router_init() already enables the
+//     OpenThread Routing Manager, which is what emits the RAs. Deleting the OMR
+//     prefix only removes the Thread->infrastructure ROUTE from local Network
+//     Data; it does NOT stop RA emission (the on-link PIO + SLLAO are sent
+//     regardless), and the routing manager simply re-publishes the prefix.
+//   * The BR's RAs carry Router Lifetime 0 — the device is never advertised as
+//     an IPv6 default gateway, so it cannot hijack the LAN default route. The
+//     host "router" neighbour flag is just the standard NDP IsRouter bit set on
+//     any RA sender; it is not "I am your gateway".
+//   * The OMR default-route prefix is exactly what gives Thread/Matter devices a
+//     route out to the LAN/internet, so removing it degrades the border
+//     router's core function (and Matter-over-Thread connectivity).
+//
+// Manage any genuine LAN-side IPv6 conflict at the router (disable NAT66, keep a
+// single RA source on the segment) rather than in firmware. See README
+// "Network Notes".
 
 void ot_br_init(void *ctx)
 {
@@ -240,10 +203,6 @@ void ot_br_init(void *ctx)
     if (wifi_or_ethernet_connected) {
         esp_openthread_set_backbone_netif(get_example_netif());
         ESP_ERROR_CHECK(esp_openthread_border_router_init());
-        // Reactively suppress backbone RA flooding on every network-data change.
-        if (otSetStateChangedCallback(esp_openthread_get_instance(), ot_state_changed, NULL) != OT_ERROR_NONE) {
-            ESP_LOGW(TAG, "Failed to register RA-suppression state callback");
-        }
 #if CONFIG_EXAMPLE_CONNECT_WIFI
         esp_ot_wifi_border_router_init_flag_set(true);
 #endif
@@ -458,9 +417,6 @@ void app_main(void)
     esp_openthread_register_rcp_failure_handler(rcp_failure_hardware_reset_handler);
 #endif
     xTaskCreate(ot_task_worker, "ot_br_main", 8192, xTaskGetCurrentTaskHandle(), 5, NULL);
-    // Create the RA-suppression worker before ot_br_init so s_ra_worker is set
-    // before ot_br_init registers the state-changed callback that signals it.
-    xTaskCreate(ra_suppress_worker, "ra_suppress", 4096, NULL, 3, &s_ra_worker);
     xTaskCreate(ot_br_init, "ot_br_init", 6144, NULL, 4, NULL);
     start_dataset_server();
 }
