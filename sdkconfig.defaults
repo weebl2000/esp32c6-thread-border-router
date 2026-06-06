@@ -29,6 +29,32 @@ CONFIG_EXAMPLE_WIFI_PASSWORD="YOUR_WIFI_PASSWORD"
 CONFIG_OPENTHREAD_RADIO_NATIVE=y
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 
+# Auto-start: connect to the configured Wi-Fi and form the Thread network on
+# boot. REQUIRED — without it ot_br_init does nothing (no Wi-Fi, no border
+# router). Defaults to 'n' in the example's Kconfig, so it must be set here.
+CONFIG_OPENTHREAD_BR_AUTO_START=y
+
+# NOTE: the OpenThread CLI is intentionally left on its default UART0 console.
+# Routing it to the USB-Serial-JTAG (to reach it over the XIAO's USB-C port)
+# makes the ot_cli task busy-spin and trips the task watchdog, so we don't.
+# Configure the Thread network via the build options below instead of the CLI.
+
+# -----------------------------------------------------------------------------
+# Thread network credentials — CHANGE THESE (security)
+# -----------------------------------------------------------------------------
+# The stock ESP-IDF OpenThread defaults use a PUBLICLY KNOWN example network key
+# (00112233...), PAN ID 0x1234, etc. — every unmodified build forms a Thread
+# mesh anyone within radio range can join or sniff. Generate your own:
+#     openssl rand -hex 16    # NETWORK key and PSKc (16 bytes each)
+#     openssl rand -hex 8     # extended PAN ID (8 bytes)
+# then uncomment and fill these in. Only takes effect on a fresh NVS
+# (idf.py erase-flash) — a previously-formed dataset persists in flash.
+#CONFIG_OPENTHREAD_NETWORK_MASTERKEY="<32 hex chars>"
+#CONFIG_OPENTHREAD_NETWORK_PSKC="<32 hex chars>"
+#CONFIG_OPENTHREAD_NETWORK_EXTPANID="<16 hex chars>"
+#CONFIG_OPENTHREAD_NETWORK_PANID=0x1234
+#CONFIG_OPENTHREAD_MESH_LOCAL_PREFIX="fdXX:XXXX:XXXX:0::/64"
+
 # -----------------------------------------------------------------------------
 # Compiler optimisations — needed to fit in 4MB
 # -----------------------------------------------------------------------------

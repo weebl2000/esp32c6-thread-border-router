@@ -231,6 +231,9 @@ The ESP advertises the Thread network prefix (eg `fd55:ec6e:b588::/48` by defaul
 ### Build fails with "Tool doesn't match supported version"
 You have multiple ESP-IDF versions installed. Always open a **fresh terminal** and run `export.bat` / `. ./export.sh` from your **cloned v5.4.2** folder before running any `idf.py` command.
 
+### Build fails with "esp_http_server.h: No such file or directory"
+The REST API in `esp_ot_br.c` depends on the `esp_http_server` component. If your ESP-IDF version's `ot_br` example doesn't already require it, add `esp_http_server` to the `REQUIRES` (or `PRIV_REQUIRES`) list in `examples/openthread/ot_br/main/CMakeLists.txt`, then rebuild.
+
 ### LAN IPv6 stops working when ESP is powered on
 The ESP's border routing manager sends Router Advertisements on WiFi which can conflict with your router. The `suppress_backbone_ra_task` in the firmware handles this automatically after 20 seconds. If you still see issues, check that `otBorderRouterRemoveOnMeshPrefix` is being called successfully in the logs.
 

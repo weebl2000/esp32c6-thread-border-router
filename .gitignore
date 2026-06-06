@@ -53,3 +53,14 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# ESP-IDF — cloned into the repo root when following README Step 1.
+# It's a separate upstream checkout, not part of this project.
+/esp-idf/
+
+# ESP-IDF build output (if you ever build inside this repo)
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock

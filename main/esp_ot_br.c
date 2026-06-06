@@ -43,7 +43,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "hal/uart_types.h"
+#include "openthread/border_router.h"
 #include "openthread/error.h"
+#include "openthread/instance.h"
 #include "openthread/logging.h"
 #include "openthread/tasklet.h"
 
@@ -131,6 +133,65 @@ static void ot_task_worker(void *aContext)
     vTaskDelete(NULL);
 }
 
+// --- Suppress backbone RA flooding ---
+// The OpenThread routing manager publishes a default-route on-mesh prefix and
+// floods the WiFi/backbone link with IPv6 Router Advertisements, which breaks
+// existing LAN IPv6 setups. We reactively remove default-route on-mesh prefixes
+// whenever the network data changes, rather than once at boot — the routing
+// manager can re-publish them at any time. (Calling otBorderRoutingSetEnabled()
+// to stop this at the source caused a SW_CPU reset, hence this approach.)
+#define RA_MAX_PREFIXES 8
+static TaskHandle_t s_ra_worker = NULL;
+
+static void ra_suppress_once(void)
+{
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otInstance *instance = esp_openthread_get_instance();
+    otNetworkDataIterator iterator = OT_NETWORK_DATA_ITERATOR_INIT;
+    otBorderRouterConfig config;
+    otIp6Prefix to_remove[RA_MAX_PREFIXES];
+    int n = 0;
+    // Single pass — collect default-route prefixes. No iterator reset, so this
+    // can never loop forever even if a removal fails to take effect.
+    while (n < RA_MAX_PREFIXES &&
+           otBorderRouterGetNextOnMeshPrefix(instance, &iterator, &config) == OT_ERROR_NONE) {
+        if (config.mDefaultRoute) {
+            to_remove[n++] = config.mPrefix;
+        }
+    }
+    if (n == RA_MAX_PREFIXES) {
+        ESP_LOGW(TAG, "RA suppression: hit prefix cap (%d), some may remain", RA_MAX_PREFIXES);
+    }
+    for (int i = 0; i < n; i++) {
+        otBorderRouterRemoveOnMeshPrefix(instance, &to_remove[i]);
+    }
+    if (n > 0) {
+        // Register the updated local network data once, after all removals.
+        otBorderRouterRegister(instance);
+        ESP_LOGI(TAG, "RA suppression: removed %d default-route prefix(es)", n);
+    }
+    esp_openthread_lock_release();
+}
+
+static void ra_suppress_worker(void *arg)
+{
+    for (;;) {
+        // Block until ot_state_changed() signals a network-data change.
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        ra_suppress_once();
+    }
+}
+
+// Runs in the OpenThread task with the OT lock already held — do NOT acquire the
+// lock or mutate network data here. Just defer the work to the worker task.
+static void ot_state_changed(otChangedFlags flags, void *context)
+{
+    if ((flags & OT_CHANGED_THREAD_NETDATA) && s_ra_worker != NULL) {
+        xTaskNotifyGive(s_ra_worker);
+    }
+}
+// --- end RA suppression ---
+
 void ot_br_init(void *ctx)
 {
 #if CONFIG_OPENTHREAD_CLI_WIFI
@@ -179,6 +240,10 @@ void ot_br_init(void *ctx)
     if (wifi_or_ethernet_connected) {
         esp_openthread_set_backbone_netif(get_example_netif());
         ESP_ERROR_CHECK(esp_openthread_border_router_init());
+        // Reactively suppress backbone RA flooding on every network-data change.
+        if (otSetStateChangedCallback(esp_openthread_get_instance(), ot_state_changed, NULL) != OT_ERROR_NONE) {
+            ESP_LOGW(TAG, "Failed to register RA-suppression state callback");
+        }
 #if CONFIG_EXAMPLE_CONNECT_WIFI
         esp_ot_wifi_border_router_init_flag_set(true);
 #endif
@@ -193,40 +258,29 @@ void ot_br_init(void *ctx)
     vTaskDelete(NULL);
 }
 
-// --- Suppress backbone RA flooding ---
-#include "openthread/border_router.h"
-
-static void suppress_backbone_ra_task(void *arg)
-{
-    vTaskDelay(pdMS_TO_TICKS(20000));
-    esp_openthread_lock_acquire(portMAX_DELAY);
-    otInstance *instance = esp_openthread_get_instance();
-    otNetworkDataIterator iterator = OT_NETWORK_DATA_ITERATOR_INIT;
-    otBorderRouterConfig config;
-    int removed = 0;
-    while (otBorderRouterGetNextOnMeshPrefix(instance, &iterator, &config) == OT_ERROR_NONE) {
-        if (config.mDefaultRoute) {
-            otBorderRouterRemoveOnMeshPrefix(instance, &config.mPrefix);
-            otBorderRouterRegister(instance);
-            removed++;
-            // Reset iterator after removal
-            iterator = OT_NETWORK_DATA_ITERATOR_INIT;
-        }
-    }
-    ESP_LOGI(TAG, "RA suppression: removed %d default-route prefix(es)", removed);
-    esp_openthread_lock_release();
-    vTaskDelete(NULL);
-}
-// --- end RA suppression ---
-
 // --- OTBR-compatible REST API (port 8080) ---
-// Implements the endpoints Home Assistant Matter integration expects:
-//   GET /node                        -> {"State":4}
-//   GET /networks/dataset/active     -> {"ActiveDataset":"0e08..."}
-//   GET /dataset                     -> raw hex (convenience)
+// Implements the endpoints Home Assistant's OpenThread Border Router integration
+// (python-otbr-api) calls during setup, plus a couple of convenience routes:
+//   GET /node                     -> {"State":4}
+//   GET /node/dataset/active      -> raw hex TLVs (text/plain), 204 if none   [HA]
+//   GET /node/ba-id               -> "<32 hex>" JSON string (border agent id) [HA]
+//   GET /node/ext-address         -> "<16 hex>" JSON string (ext address)     [HA]
+//   GET /networks/dataset/active  -> {"ActiveDataset":"0e08..."}  (non-standard, kept)
+//   GET /dataset                  -> raw hex (convenience)
 #include "esp_http_server.h"
+#include "openthread/border_agent.h"
 #include "openthread/dataset.h"
+#include "openthread/link.h"
 #include "openthread/thread.h"
+
+// Write n bytes as lowercase hex into out (out must hold 2*n + 1 chars).
+static void bytes_to_hex(const uint8_t *in, size_t n, char *out)
+{
+    for (size_t i = 0; i < n; i++) {
+        snprintf(out + i * 2, 3, "%02x", in[i]);
+    }
+    out[n * 2] = '\0';
+}
 
 static void get_dataset_hex(char *buf, size_t buflen)
 {
@@ -235,12 +289,14 @@ static void get_dataset_hex(char *buf, size_t buflen)
     otOperationalDatasetTlvs dataset;
     otError err = otDatasetGetActiveTlvs(instance, &dataset);
     esp_openthread_lock_release();
+    buf[0] = '\0';
     if (err != OT_ERROR_NONE) {
-        buf[0] = '\0';
         return;
     }
-    for (int i = 0; i < dataset.mLength; i++) {
-        sprintf(buf + i * 2, "%02x", dataset.mTlvs[i]);
+    // Bounded by buflen: need room for 2 hex chars + NUL per byte.
+    size_t pos = 0;
+    for (int i = 0; i < dataset.mLength && pos + 3 <= buflen; i++) {
+        pos += snprintf(buf + pos, buflen - pos, "%02x", dataset.mTlvs[i]);
     }
 }
 
@@ -253,8 +309,18 @@ static esp_err_t node_handler(httpd_req_t *req)
     otDeviceRole role = otThreadGetDeviceRole(instance);
     esp_openthread_lock_release();
     char resp[64];
-    // Map OT role to OTBR state number HA expects (>=4 means ready)
-    int state = (role >= OT_DEVICE_ROLE_CHILD) ? 4 : 1;
+    // Map OT role to the OTBR state number HA expects: 4 means "attached/ready".
+    int state;
+    switch (role) {
+    case OT_DEVICE_ROLE_CHILD:
+    case OT_DEVICE_ROLE_ROUTER:
+    case OT_DEVICE_ROLE_LEADER:
+        state = 4;
+        break;
+    default: // OT_DEVICE_ROLE_DISABLED, OT_DEVICE_ROLE_DETACHED
+        state = 1;
+        break;
+    }
     snprintf(resp, sizeof(resp), "{\"State\":%d}", state);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, resp);
@@ -292,6 +358,57 @@ static esp_err_t dataset_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// GET /node/dataset/active  ->  raw hex TLVs as text/plain, 204 if no dataset.
+// This is the standard OTBR path python-otbr-api reads (Accept: text/plain).
+static esp_err_t node_dataset_active_handler(httpd_req_t *req)
+{
+    char hex[OT_OPERATIONAL_DATASET_MAX_LENGTH * 2 + 1];
+    get_dataset_hex(hex, sizeof(hex));
+    httpd_resp_set_type(req, "text/plain");
+    if (hex[0] == '\0') {
+        httpd_resp_set_status(req, "204 No Content");
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+    httpd_resp_sendstr(req, hex);
+    return ESP_OK;
+}
+
+// GET /node/ba-id  ->  "<32 hex>" (JSON string). HA aborts setup if this 404s.
+static esp_err_t ba_id_handler(httpd_req_t *req)
+{
+    otBorderAgentId id;
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otError err = otBorderAgentGetId(esp_openthread_get_instance(), &id);
+    esp_openthread_lock_release();
+    if (err != OT_ERROR_NONE) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No border agent id");
+        return ESP_FAIL;
+    }
+    char hex[OT_BORDER_AGENT_ID_LENGTH * 2 + 1];
+    bytes_to_hex(id.mId, OT_BORDER_AGENT_ID_LENGTH, hex);
+    char resp[OT_BORDER_AGENT_ID_LENGTH * 2 + 3]; // quotes + NUL
+    snprintf(resp, sizeof(resp), "\"%s\"", hex);  // python-otbr-api does json()->fromhex
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, resp);
+    return ESP_OK;
+}
+
+// GET /node/ext-address  ->  "<16 hex>" (JSON string).
+static esp_err_t ext_address_handler(httpd_req_t *req)
+{
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otExtAddress ext = *otLinkGetExtendedAddress(esp_openthread_get_instance());
+    esp_openthread_lock_release();
+    char hex[sizeof(ext.m8) * 2 + 1];
+    bytes_to_hex(ext.m8, sizeof(ext.m8), hex);
+    char resp[sizeof(ext.m8) * 2 + 3];
+    snprintf(resp, sizeof(resp), "\"%s\"", hex);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, resp);
+    return ESP_OK;
+}
+
 static void start_dataset_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -304,10 +421,13 @@ static void start_dataset_server(void)
     }
     httpd_uri_t uris[] = {
         { .uri = "/node",                    .method = HTTP_GET, .handler = node_handler },
+        { .uri = "/node/dataset/active",     .method = HTTP_GET, .handler = node_dataset_active_handler },
+        { .uri = "/node/ba-id",              .method = HTTP_GET, .handler = ba_id_handler },
+        { .uri = "/node/ext-address",        .method = HTTP_GET, .handler = ext_address_handler },
         { .uri = "/networks/dataset/active", .method = HTTP_GET, .handler = active_dataset_handler },
         { .uri = "/dataset",                 .method = HTTP_GET, .handler = dataset_handler },
     };
-    for (int i = 0; i < 3; i++) {
+    for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         httpd_register_uri_handler(server, &uris[i]);
     }
     ESP_LOGI(TAG, "OTBR REST API started on port 8080");
@@ -338,7 +458,9 @@ void app_main(void)
     esp_openthread_register_rcp_failure_handler(rcp_failure_hardware_reset_handler);
 #endif
     xTaskCreate(ot_task_worker, "ot_br_main", 8192, xTaskGetCurrentTaskHandle(), 5, NULL);
+    // Create the RA-suppression worker before ot_br_init so s_ra_worker is set
+    // before ot_br_init registers the state-changed callback that signals it.
+    xTaskCreate(ra_suppress_worker, "ra_suppress", 4096, NULL, 3, &s_ra_worker);
     xTaskCreate(ot_br_init, "ot_br_init", 6144, NULL, 4, NULL);
-    xTaskCreate(suppress_backbone_ra_task, "ra_suppress", 3072, NULL, 3, NULL);
     start_dataset_server();
 }
