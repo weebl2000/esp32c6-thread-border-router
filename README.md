@@ -185,6 +185,20 @@ Should return: `{"ActiveDataset":"0e08..."}`
 
 If both work, your border router is ready.
 
+### Reading logs over WiFi
+
+The device mirrors its recent console output into an in-RAM ring buffer, readable
+without a serial cable:
+
+```
+curl http://<ESP_IP>:8080/logs
+```
+
+This returns the last ~80–100 log lines (oldest first) as plain text — useful for
+checking on the board remotely. Note it is a snapshot, not a live stream: re-run
+the command to refresh. The buffer is RAM-only, so it resets on reboot, and an
+idle/attached border router is legitimately quiet (OpenThread logs at WARN).
+
 ---
 
 ## Step 7 — Configure Home Assistant

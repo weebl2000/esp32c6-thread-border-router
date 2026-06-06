@@ -29,7 +29,10 @@
  *     conflict at the router (disable NAT66, single RA source). See README.
  */
 
+#include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "sdkconfig.h"
@@ -98,6 +101,7 @@ static void rcp_failure_hardware_reset_handler(void)
 //   GET /node/ext-address         -> "<16 hex>" JSON string (ext address)     [HA]
 //   GET /networks/dataset/active  -> {"ActiveDataset":"0e08..."}  (non-standard, kept)
 //   GET /dataset                  -> raw hex (convenience)
+//   GET /logs                     -> recent device log lines (text/plain, oldest first)
 
 // Write n bytes as lowercase hex into out (out must hold 2*n + 1 chars).
 static void bytes_to_hex(const uint8_t *in, size_t n, char *out)
@@ -235,6 +239,95 @@ static esp_err_t ext_address_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// --- /logs: in-RAM log ring buffer (local addition) ---
+// Mirrors every esp_log line into a fixed circular buffer so the most recent
+// output can be read back over WiFi (the board is otherwise only observable on
+// the UART0 / USB-Serial-JTAG console). The hook still forwards to the original
+// vprintf, so serial logging is unchanged. Sized to stay well within the 4 MB
+// build's RAM budget; holds roughly the last ~80-100 lines.
+#define LOG_RING_SIZE 8192
+static char s_log_ring[LOG_RING_SIZE];
+static size_t s_log_head;                                       // next write index
+static bool s_log_wrapped;                                      // ring filled at least once
+static portMUX_TYPE s_log_mux = portMUX_INITIALIZER_UNLOCKED;
+static vprintf_like_t s_prev_vprintf;                           // original console sink
+
+static void log_ring_write(const char *data, size_t len)
+{
+    portENTER_CRITICAL(&s_log_mux);
+    for (size_t i = 0; i < len; i++) {
+        s_log_ring[s_log_head++] = data[i];
+        if (s_log_head >= LOG_RING_SIZE) {
+            s_log_head = 0;
+            s_log_wrapped = true;
+        }
+    }
+    portEXIT_CRITICAL(&s_log_mux);
+}
+
+// esp_log hook: capture into the ring, then forward to the original sink so the
+// serial console keeps working. Called in task context only (ISR/early logs go
+// through a different path), so the short critical section in log_ring_write is safe.
+static int log_vprintf_hook(const char *fmt, va_list ap)
+{
+    char line[256];
+    va_list ap_copy;
+    va_copy(ap_copy, ap);
+    int n = vsnprintf(line, sizeof(line), fmt, ap_copy);
+    va_end(ap_copy);
+    if (n > 0) {
+        size_t len = (n < (int)sizeof(line)) ? (size_t)n : sizeof(line) - 1;
+        log_ring_write(line, len);
+    }
+    return s_prev_vprintf ? s_prev_vprintf(fmt, ap) : n;
+}
+
+static void start_log_capture(void)
+{
+    s_prev_vprintf = esp_log_set_vprintf(log_vprintf_hook);
+}
+
+// GET /logs  ->  the ring buffer contents as text/plain, oldest line first.
+static esp_err_t logs_handler(httpd_req_t *req)
+{
+    char *buf = malloc(LOG_RING_SIZE);
+    if (buf == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_FAIL;
+    }
+    // Snapshot under the lock (linearising the circular buffer), then send outside it.
+    size_t len;
+    bool wrapped;
+    portENTER_CRITICAL(&s_log_mux);
+    wrapped = s_log_wrapped;
+    if (s_log_wrapped) {
+        size_t tail = LOG_RING_SIZE - s_log_head;  // head..end holds the oldest bytes
+        memcpy(buf, s_log_ring + s_log_head, tail);
+        memcpy(buf + tail, s_log_ring, s_log_head);
+        len = LOG_RING_SIZE;
+    } else {
+        memcpy(buf, s_log_ring, s_log_head);
+        len = s_log_head;
+    }
+    portEXIT_CRITICAL(&s_log_mux);
+
+    // Once wrapped, the oldest retained byte usually lands mid-line; drop that
+    // leading fragment so the response always starts on a clean line boundary.
+    char *out = buf;
+    size_t out_len = len;
+    if (wrapped) {
+        char *nl = memchr(buf, '\n', len);
+        if (nl != NULL) {
+            out = nl + 1;
+            out_len = len - (size_t)(out - buf);
+        }
+    }
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, out, out_len);
+    free(buf);
+    return ESP_OK;
+}
+
 static void start_dataset_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -252,6 +345,7 @@ static void start_dataset_server(void)
         { .uri = "/node/ext-address",        .method = HTTP_GET, .handler = ext_address_handler },
         { .uri = "/networks/dataset/active", .method = HTTP_GET, .handler = active_dataset_handler },
         { .uri = "/dataset",                 .method = HTTP_GET, .handler = dataset_handler },
+        { .uri = "/logs",                    .method = HTTP_GET, .handler = logs_handler },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         httpd_register_uri_handler(server, &uris[i]);
@@ -262,6 +356,10 @@ static void start_dataset_server(void)
 
 void app_main(void)
 {
+    // Local addition: start mirroring esp_log output into the /logs ring buffer
+    // first, so the OpenThread bring-up sequence is captured from the start.
+    start_log_capture();
+
     // Used eventfds:
     // * netif
     // * task queue

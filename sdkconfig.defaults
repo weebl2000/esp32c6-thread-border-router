@@ -54,6 +54,15 @@ CONFIG_OPENTHREAD_CLI_WIFI=n
 # busy-spin and trips the task watchdog, so we don't.
 
 # -----------------------------------------------------------------------------
+# mDNS — the border router mirrors Thread/Matter SRP services onto the Wi-Fi LAN
+# via mDNS. The IDF default cap (CONFIG_MDNS_MAX_SERVICES=10) is too low for a
+# Matter mesh: once hit, extra services fail to advertise (the responder logs
+# "Cannot add more services" and the SRP server returns a fail response). This
+# is a RAM cost only — no flash-partition impact — and the C6 has heap headroom.
+# -----------------------------------------------------------------------------
+CONFIG_MDNS_MAX_SERVICES=25
+
+# -----------------------------------------------------------------------------
 # Thread network credentials — CHANGE THESE (security) [optional]
 # -----------------------------------------------------------------------------
 # A previously-formed dataset persists in NVS and is reused on boot; the options
