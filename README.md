@@ -205,6 +205,16 @@ checking on the board remotely. Note it is a snapshot, not a live stream: re-run
 the command to refresh. The buffer is RAM-only, so it resets on reboot, and an
 idle/attached border router is legitimately quiet (OpenThread logs at WARN).
 
+There is also a heap diagnostic (each Thread/Matter device the router advertises
+onto the LAN costs a little RAM, so this shows how much headroom is left):
+
+```
+curl http://<ESP_IP>:8080/heap
+```
+
+Returns `{"FreeHeap":...,"MinFreeHeap":...,"LargestFreeBlock":...}` in bytes;
+`MinFreeHeap` is the low-water mark since boot.
+
 ---
 
 ## Step 7 — Configure Home Assistant
@@ -279,6 +289,19 @@ The border router emits IPv6 Router Advertisements on WiFi (this is normal and r
 ### "No Thread border router" error during commissioning
 - Verify `/node` returns `{"State":4}` — if State is 1, Thread hasn't attached yet, wait 30 seconds and try again
 - Do **Settings → Companion app → Troubleshooting → Sync Thread credentials** on your phone before each commissioning attempt
+
+### Pairing hangs at "Connecting to Thread network" (first device works, next doesn't)
+The border router mirrors every Thread device's Matter service onto the LAN via
+mDNS, and each device costs one mDNS slot **per fabric** it is joined to (Home
+Assistant + Apple/Google = 2–3 slots each), plus a temporary `_matterc._udp` slot
+while its commissioning window is open. Once `CONFIG_MDNS_MAX_SERVICES` is
+exhausted, the next device's SRP registration is rejected and pairing hangs —
+typically right after one pairing succeeded. Rebooting the border router clears
+stale entries and frees a slot or two, which is why the problem appears to be
+intermittent. Fix: raise `CONFIG_MDNS_MAX_SERVICES` (128 in the current
+`sdkconfig.defaults`) and reflash. Confirm by checking `http://<ESP_IP>:8080/logs`
+for "Cannot add more services" while a pairing is stuck, and watch heap headroom
+via `http://<ESP_IP>:8080/heap` (`MinFreeHeap` is the low-water mark since boot).
 
 ### ESP crashes after ~30 seconds (SW_CPU reset)
 Not observed with the current firmware. ESP-IDF's `esp_openthread_border_router_init()` already enables the OpenThread routing manager via the supported path, so don't call `otBorderRoutingSetEnabled()` yourself — a duplicate/early call (before the infra netif is up, or without holding the OpenThread lock) is the likely cause of the historical crash. The current code uses the stock high-level bring-up (`esp_openthread_start()` → `esp_openthread_border_router_start()`) and does not call it.

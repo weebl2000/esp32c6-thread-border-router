@@ -40,6 +40,7 @@
 #include "esp_coexist.h"
 #include "esp_err.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_openthread.h"
@@ -102,6 +103,7 @@ static void rcp_failure_hardware_reset_handler(void)
 //   GET /networks/dataset/active  -> {"ActiveDataset":"0e08..."}  (non-standard, kept)
 //   GET /dataset                  -> raw hex (convenience)
 //   GET /logs                     -> recent device log lines (text/plain, oldest first)
+//   GET /heap                     -> {"FreeHeap":..,"MinFreeHeap":..,"LargestFreeBlock":..}
 
 // Write n bytes as lowercase hex into out (out must hold 2*n + 1 chars).
 static void bytes_to_hex(const uint8_t *in, size_t n, char *out)
@@ -328,10 +330,28 @@ static esp_err_t logs_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// GET /heap  ->  current heap headroom as JSON. Diagnostic: every Thread/Matter
+// service the advertising proxy mirrors onto the LAN costs heap (mDNS + SRP
+// server entries), so watch MinFreeHeap as the mesh grows — it is the low-water
+// mark since boot. No OpenThread state is read, so no lock is needed.
+static esp_err_t heap_handler(httpd_req_t *req)
+{
+    char resp[112];
+    int n = snprintf(resp, sizeof(resp),
+                     "{\"FreeHeap\":%u,\"MinFreeHeap\":%u,\"LargestFreeBlock\":%u}",
+                     (unsigned)esp_get_free_heap_size(),
+                     (unsigned)esp_get_minimum_free_heap_size(),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, n);
+    return ESP_OK;
+}
+
 static void start_dataset_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 8080;
+    config.max_uri_handlers = 12;  // default is 8; we register 8 and want headroom
     config.uri_match_fn = httpd_uri_match_wildcard;
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {
@@ -346,6 +366,7 @@ static void start_dataset_server(void)
         { .uri = "/networks/dataset/active", .method = HTTP_GET, .handler = active_dataset_handler },
         { .uri = "/dataset",                 .method = HTTP_GET, .handler = dataset_handler },
         { .uri = "/logs",                    .method = HTTP_GET, .handler = logs_handler },
+        { .uri = "/heap",                    .method = HTTP_GET, .handler = heap_handler },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         httpd_register_uri_handler(server, &uris[i]);
