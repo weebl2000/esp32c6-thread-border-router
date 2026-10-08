@@ -266,6 +266,35 @@ The border router advertises a route to its **OMR prefix** (a ULA /64 it generat
 - The onboard antenna is small — keep the ESP within 5m of your router (or closer, same with the thread device!)
 - Signal below -85 dBm causes instability with Thread coexistence
 
+### The BR works for days, then goes offline until I power-cycle it
+If the board is only reachable again after a **manual power cycle** — it never
+recovers on its own — this is not a crash. The chip is still running and still
+attached to Thread; it has permanently given up on WiFi.
+
+`protocol_examples_common` counts `WIFI_EVENT_STA_DISCONNECTED` events and, once
+the count exceeds `CONFIG_EXAMPLE_WIFI_CONN_MAX_RETRY` (**upstream default: 6**),
+logs `WiFi Connect failed N times, stop reconnect.` and unregisters its own
+disconnect handler. After that nothing ever calls `esp_wifi_connect()` again —
+there is no WiFi supervision in `app_main` to undo it. The counter only resets in
+the IPv4 `GOT_IP` handler, so it takes 7 disconnects with no DHCP lease in
+between. Two everyday triggers:
+
+- **The AP disappears briefly** (router reboot, firmware update, channel change).
+  Six retries are spent in well under a minute — long before the AP is back.
+- **Roaming in a mesh WiFi** (e.g. Fritz!Box + repeaters). The counter is bumped
+  *before* the `WIFI_REASON_ROAMING` early-return, and a roam that keeps the same
+  lease never produces a `GOT_IP` to reset it — so roams accumulate indefinitely.
+  This is why the failure looks random and can take days or weeks to show up.
+
+Fix: `CONFIG_EXAMPLE_WIFI_CONN_MAX_RETRY=2147483647` (already in this repo's
+`sdkconfig.defaults`), then rebuild and reflash. Upstream fixed this *after* the
+v5.5 branch by treating `-1` as infinite — **do not set `-1` on v5.5.x**, where
+the `>= 0` guard doesn't exist and the BR would then give up on the very first
+disconnect. Bumping ESP-IDF within 5.5.x does **not** fix this.
+
+To confirm the diagnosis after the fact, check that `/logs` spans only a short
+uptime after each recovery, and grep it for `stop reconnect`.
+
 ### Build fails with "Tool doesn't match supported version"
 You have multiple ESP-IDF versions installed. Always open a **fresh terminal** and run `export.bat` / `. ./export.sh` from your **cloned v5.5.4** folder before running any `idf.py` command. (Each ESP-IDF version ships its own matched toolchain + Python venv; run that version's `install.sh esp32c6` once.)
 

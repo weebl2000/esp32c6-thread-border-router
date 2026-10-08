@@ -29,6 +29,33 @@ CONFIG_EXAMPLE_CONNECT_IPV6=y
 CONFIG_EXAMPLE_WIFI_SSID="YOUR_WIFI_SSID"
 CONFIG_EXAMPLE_WIFI_PASSWORD="YOUR_WIFI_PASSWORD"
 
+# Never stop trying to reconnect. THIS IS LOAD-BEARING for an always-on border
+# router — with the example's default of 6, the BR permanently drops off the LAN.
+#
+# protocol_examples_common's example_handler_on_wifi_disconnect() increments a
+# retry counter on every WIFI_EVENT_STA_DISCONNECTED and, once it exceeds this
+# value, logs "WiFi Connect failed N times, stop reconnect." and calls
+# example_wifi_sta_do_disconnect() — which UNREGISTERS the disconnect handler.
+# Nothing ever calls esp_wifi_connect() again: the chip keeps running and stays
+# attached to Thread, but is unreachable over Wi-Fi (no REST API, no mDNS, HA
+# marks the OTBR dead) until a manual power cycle. It is a permanent latch, not
+# a transient — and app_main has no Wi-Fi supervision to undo it.
+#
+# The counter is only reset in the IPv4 GOT_IP handler, so it takes 7 disconnects
+# with no successful DHCP lease in between. Two ways that happens here:
+#   * AP briefly gone (router reboot / firmware update / channel change) — the 6
+#     retries are spent in well under a minute, long before the AP returns.
+#   * Roaming in a mesh (Fritz!Box + repeaters): the counter is incremented
+#     BEFORE the WIFI_REASON_ROAMING early-return, and a roam that keeps the
+#     same lease produces no GOT_IP to reset it — so roams accumulate forever.
+#
+# Upstream fixed this AFTER the v5.5 branch: master guards the check with
+# "CONFIG_EXAMPLE_WIFI_CONN_MAX_RETRY >= 0" and documents -1 as infinite.
+# DO NOT set -1 on v5.5.x — that guard does not exist here, so "s_retry_num > -1"
+# is true on the very FIRST disconnect and the BR gives up immediately. Instead
+# pin INT_MAX, which the v5.5.x comparison can never exceed.
+CONFIG_EXAMPLE_WIFI_CONN_MAX_RETRY=2147483647
+
 # -----------------------------------------------------------------------------
 # OpenThread — single-chip C6: native 802.15.4 radio + Wi-Fi/15.4 SW coexistence
 # -----------------------------------------------------------------------------
