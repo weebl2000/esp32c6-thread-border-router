@@ -72,6 +72,23 @@ CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 CONFIG_OPENTHREAD_BORDER_ROUTER_AUTO_START=y
 CONFIG_OPENTHREAD_NETWORK_AUTO_START=y
 
+# Thread table sizes. The stock defaults are sized for a small test mesh and
+# silently cap a long-running home BR:
+#   *_MLE_MAX_CHILDREN (default 10): when the child table is full, OpenThread
+#     ignores MLE Parent Requests outright (mle_ftd.cpp, GetNewChild() -> NoBufs).
+#     Sleepy Matter devices accumulate on the BR over weeks of uptime, so a new
+#     joiner that only hears the BR can't attach and pairing hangs at
+#     "Connecting to Thread network" — until a BR reboot scatters the children
+#     onto other routers and frees slots. Check GET /diag (Children/ChildrenMax).
+#   IEEE802154_PENDING_TABLE_SIZE (default 20): radio frame-pending entries for
+#     sleepy children — keep it >= MAX_CHILDREN.
+#   *_TMF_ADDR_CACHE_ENTRIES (default 20): EID->RLOC16 cache the BR uses to
+#     forward LAN traffic (HA/Matter) to Thread devices; headroom for the mesh to grow.
+# RAM cost is a few KB of .bss in total.
+CONFIG_OPENTHREAD_MLE_MAX_CHILDREN=32
+CONFIG_IEEE802154_PENDING_TABLE_SIZE=32
+CONFIG_OPENTHREAD_TMF_ADDR_CACHE_ENTRIES=32
+
 # The border-router auto-init path hard-#errors if the CLI 'wifi' command is on,
 # and we drive Wi-Fi via example_connect instead — keep it off.
 CONFIG_OPENTHREAD_CLI_WIFI=n

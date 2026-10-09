@@ -65,7 +65,10 @@
 #include "openthread/border_agent.h"
 #include "openthread/dataset.h"
 #include "openthread/link.h"
+#include "openthread/message.h"
+#include "openthread/srp_server.h"
 #include "openthread/thread.h"
+#include "openthread/thread_ftd.h"
 
 #if CONFIG_OPENTHREAD_STATE_INDICATOR_ENABLE
 #include "ot_led_strip.h"
@@ -104,6 +107,7 @@ static void rcp_failure_hardware_reset_handler(void)
 //   GET /dataset                  -> raw hex (convenience)
 //   GET /logs                     -> recent device log lines (text/plain, oldest first)
 //   GET /heap                     -> {"FreeHeap":..,"MinFreeHeap":..,"LargestFreeBlock":..}
+//   GET /diag                     -> Thread table usage vs. limits (children, routers, SRP, ...)
 
 // Write n bytes as lowercase hex into out (out must hold 2*n + 1 chars).
 static void bytes_to_hex(const uint8_t *in, size_t n, char *out)
@@ -347,12 +351,114 @@ static esp_err_t heap_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// GET /diag  ->  usage of the fixed-size Thread tables vs. their limits, as JSON.
+// Diagnostic for "a new device won't join until the BR is restarted": read this
+// BEFORE restarting. Children == ChildrenMax means the BR silently ignores MLE
+// Parent Requests (a joiner that only hears the BR can't attach); a low
+// MsgBuffersFree / high MsgBuffersMaxUsed means message-pool exhaustion;
+// AddrCacheQuerying close to AddrCacheMax means LAN->Thread forwarding is stalled
+// on address queries; SrpHosts/SrpServices track what the advertising proxy
+// mirrors onto mDNS. Uptime (seconds) tells you how long state has accumulated.
+static esp_err_t diag_handler(httpd_req_t *req)
+{
+    uint16_t children = 0, children_sleepy = 0, children_max;
+    uint16_t routers = 0, router_links = 0, neighbors = 0;
+    uint16_t srp_hosts = 0, srp_services = 0;
+    uint16_t cache_entries = 0, cache_querying = 0;
+    otBufferInfo buffers;
+
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otInstance *instance = esp_openthread_get_instance();
+    const char *role = otThreadDeviceRoleToString(otThreadGetDeviceRole(instance));
+
+    children_max = otThreadGetMaxAllowedChildren(instance);
+    for (uint16_t i = 0; i < children_max; i++) {
+        otChildInfo child;
+        if (otThreadGetChildInfoByIndex(instance, i, &child) == OT_ERROR_NONE) {
+            children++;
+            if (!child.mRxOnWhenIdle) {
+                children_sleepy++;
+            }
+        }
+    }
+
+    uint8_t max_router_id = otThreadGetMaxRouterId(instance);
+    for (uint16_t id = 0; id <= max_router_id; id++) {
+        otRouterInfo router;
+        if (otThreadGetRouterInfo(instance, id, &router) == OT_ERROR_NONE && router.mAllocated) {
+            routers++;
+            if (router.mLinkEstablished) {
+                router_links++;
+            }
+        }
+    }
+
+    otNeighborInfoIterator neighbor_iter = OT_NEIGHBOR_INFO_ITERATOR_INIT;
+    otNeighborInfo neighbor;
+    while (otThreadGetNextNeighborInfo(instance, &neighbor_iter, &neighbor) == OT_ERROR_NONE) {
+        neighbors++;
+    }
+
+    for (const otSrpServerHost *host = otSrpServerGetNextHost(instance, NULL); host != NULL;
+         host = otSrpServerGetNextHost(instance, host)) {
+        if (otSrpServerHostIsDeleted(host)) {
+            continue;
+        }
+        srp_hosts++;
+        for (const otSrpServerService *svc = otSrpServerHostGetNextService(host, NULL); svc != NULL;
+             svc = otSrpServerHostGetNextService(host, svc)) {
+            if (!otSrpServerServiceIsDeleted(svc)) {
+                srp_services++;
+            }
+        }
+    }
+
+    otCacheEntryIterator cache_iter;
+    memset(&cache_iter, 0, sizeof(cache_iter));
+    otCacheEntryInfo entry;
+    while (otThreadGetNextCacheEntry(instance, &entry, &cache_iter) == OT_ERROR_NONE) {
+        cache_entries++;
+        if (entry.mState == OT_CACHE_ENTRY_STATE_QUERY || entry.mState == OT_CACHE_ENTRY_STATE_RETRY_QUERY) {
+            cache_querying++;
+        }
+    }
+
+    otMessageGetBufferInfo(instance, &buffers);
+    esp_openthread_lock_release();
+
+    char resp[512];
+    int n = snprintf(resp, sizeof(resp),
+                     "{\"Uptime\":%lu,\"Role\":\"%s\","
+                     "\"Children\":%u,\"ChildrenSleepy\":%u,\"ChildrenMax\":%u,"
+                     "\"Routers\":%u,\"RouterLinks\":%u,\"Neighbors\":%u,"
+                     "\"SrpHosts\":%u,\"SrpServices\":%u,"
+                     "\"AddrCache\":%u,\"AddrCacheQuerying\":%u,\"AddrCacheMax\":%u,"
+                     "\"MsgBuffersTotal\":%u,\"MsgBuffersFree\":%u,\"MsgBuffersMaxUsed\":%u}",
+                     (unsigned long)(xTaskGetTickCount() / configTICK_RATE_HZ), role,
+                     children, children_sleepy, children_max,
+                     routers, router_links, neighbors,
+                     srp_hosts, srp_services,
+                     cache_entries, cache_querying, (unsigned)CONFIG_OPENTHREAD_TMF_ADDR_CACHE_ENTRIES,
+                     buffers.mTotalBuffers, buffers.mFreeBuffers, buffers.mMaxUsedBuffers);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, n);
+    return ESP_OK;
+}
+
 static void start_dataset_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 8080;
-    config.max_uri_handlers = 12;  // default is 8; we register 8 and want headroom
+    config.max_uri_handlers = 12;  // default is 8; we register 9 and want headroom
     config.uri_match_fn = httpd_uri_match_wildcard;
+    // The default 7 client sockets + 3 internal ones use up all of
+    // CONFIG_LWIP_MAX_SOCKETS (10). Without these two, a client that vanishes
+    // mid-connection (Wi-Fi drop/roam) leaves a half-open socket the server never
+    // reclaims; after 7 of those the REST API refuses every new connection until
+    // a reboot. keep_alive_enable turns on TCP keepalive so dead peers are reaped
+    // (~20 s idle); lru_purge_enable evicts the oldest session if all are in use.
+    config.lru_purge_enable = true;
+    config.keep_alive_enable = true;
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start dataset HTTP server");
@@ -367,6 +473,7 @@ static void start_dataset_server(void)
         { .uri = "/dataset",                 .method = HTTP_GET, .handler = dataset_handler },
         { .uri = "/logs",                    .method = HTTP_GET, .handler = logs_handler },
         { .uri = "/heap",                    .method = HTTP_GET, .handler = heap_handler },
+        { .uri = "/diag",                    .method = HTTP_GET, .handler = diag_handler },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         httpd_register_uri_handler(server, &uris[i]);

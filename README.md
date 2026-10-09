@@ -215,6 +215,19 @@ curl http://<ESP_IP>:8080/heap
 Returns `{"FreeHeap":...,"MinFreeHeap":...,"LargestFreeBlock":...}` in bytes;
 `MinFreeHeap` is the low-water mark since boot.
 
+And a Thread diagnostic showing how full the border router's fixed-size tables are:
+
+```
+curl http://<ESP_IP>:8080/diag
+```
+
+Returns `Uptime` (seconds), `Role`, `Children`/`ChildrenSleepy`/`ChildrenMax`,
+`Routers`/`RouterLinks`/`Neighbors`, `SrpHosts`/`SrpServices` (what's mirrored
+onto mDNS), `AddrCache`/`AddrCacheQuerying`/`AddrCacheMax`, and
+`MsgBuffersTotal`/`MsgBuffersFree`/`MsgBuffersMaxUsed`. If something stops
+working after long uptime, read this **before** rebooting — a reboot wipes the
+evidence.
+
 ---
 
 ## Step 7 — Configure Home Assistant
@@ -331,6 +344,30 @@ intermittent. Fix: raise `CONFIG_MDNS_MAX_SERVICES` (128 in the current
 `sdkconfig.defaults`) and reflash. Confirm by checking `http://<ESP_IP>:8080/logs`
 for "Cannot add more services" while a pairing is stuck, and watch heap headroom
 via `http://<ESP_IP>:8080/heap` (`MinFreeHeap` is the low-water mark since boot).
+
+### After days/weeks of uptime, new devices won't pair until I reboot the BR
+A second cause of the same "Connecting to Thread network" hang, which shows up only
+after long uptime: the border router's **child table is full**. A joining device
+first attaches to a nearby router as a *child*; when the router's child table is
+full, OpenThread silently ignores the request. Sleepy (battery) Matter devices
+slowly collect on the border router as their preferred parent, and the stock limit
+is only 10 (`CONFIG_OPENTHREAD_MLE_MAX_CHILDREN`). A new device that can only hear
+the border router then can't join. Rebooting "fixes" it because the BR's children
+move to other routers, which frees slots for a while.
+
+Confirm with `curl http://<ESP_IP>:8080/diag` **while pairing is stuck**:
+`Children` equal to `ChildrenMax` is this problem. Fix: the current
+`sdkconfig.defaults` raises the child table to 32 (plus the matching
+`CONFIG_IEEE802154_PENDING_TABLE_SIZE` and the address cache). Because
+`sdkconfig.defaults` doesn't override values already in the example's `sdkconfig`,
+also set them there (or via menuconfig) before rebuilding.
+
+### The REST API stops responding but the BR is still on WiFi
+Older firmware used the HTTP server's defaults, which use up all 10 lwIP sockets
+and never reclaim a connection whose client vanished (WiFi drop/roam). After 7 such
+half-open connections, every new request was refused until a reboot. Current
+firmware enables TCP keepalive and LRU purging on the server, so dead connections
+are reclaimed automatically.
 
 ### ESP crashes after ~30 seconds (SW_CPU reset)
 Not observed with the current firmware. ESP-IDF's `esp_openthread_border_router_init()` already enables the OpenThread routing manager via the supported path, so don't call `otBorderRoutingSetEnabled()` yourself — a duplicate/early call (before the infra netif is up, or without holding the OpenThread lock) is the likely cause of the historical crash. The current code uses the stock high-level bring-up (`esp_openthread_start()` → `esp_openthread_border_router_start()`) and does not call it.
